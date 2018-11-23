@@ -27,6 +27,10 @@
 #include <fcntl.h>
 #include <scsi/sg.h>
 #include <scsi/scsi.h>
+#include <uuid/uuid.h>
+#include <stdbool.h>
+#include <linux/nvme.h>
+#include <linux/nvme_ioctl.h>
 
 /*
  *  * Default 5 second timeout
@@ -223,7 +227,7 @@ static int check_scsi_serial(unsigned char *buf,
 	return 0;
 }
 
-static void make_scsi_request(int fd, int evpd, int pageno, unsigned char *buf,
+static int make_scsi_request(int fd, int evpd, int pageno, unsigned char *buf,
 		size_t buflen)
 {
 	unsigned char inq_cmd[] = { INQUIRY_CMD, evpd, pageno, 0, buflen, 0 };
@@ -243,9 +247,43 @@ static void make_scsi_request(int fd, int evpd, int pageno, unsigned char *buf,
 	io_hdr.timeout = DEF_TIMEOUT;
 
 	if (ioctl (fd, SG_IO, &io_hdr) == -1) {
-		perror ("ioctl failed.");
-		exit (EXIT_FAILURE);
+		return -1;
 	}
+	return 0;
+}
+
+static int make_nvme_request(int fd, struct nvme_id_ctrl* ctrl, struct nvme_id_ns* ns)
+{
+	int nsid, ret = 0;
+	struct nvme_admin_cmd cmd;
+
+	if (ctrl == NULL || ns == NULL) {
+		return -1;
+	}
+	memset(&cmd, 0, sizeof(cmd));
+	memset(ctrl, 0, sizeof(struct nvme_id_ctrl));
+	cmd.opcode = nvme_admin_identify;
+	cmd.nsid = 0;
+	cmd.addr = (unsigned long)(ctrl);
+	cmd.data_len = 4096;
+	cmd.cdw10 = 1;
+	ret = ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd);
+	if (ret != 0) {
+		return ret;
+	}
+	nsid = ioctl(fd, NVME_IOCTL_ID);
+	memset(ns, 0, sizeof(struct nvme_id_ns));
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = nvme_admin_identify;
+	cmd.nsid = nsid;
+	cmd.addr = (unsigned long)(ns);
+	cmd.data_len = 4096;
+	cmd.cdw10 = 0;
+	ret = ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd);
+	if (ret != 0) {
+		return ret;
+	}
+	return 0;
 }
 
 static void replace_whitespace(const char *str, char *to, size_t len)
@@ -331,6 +369,8 @@ int main(int argc, char **argv)
 			revision[REVISION_LENGTH + 1];
 	unsigned char buf[SCSI_INQ_BUFF_LEN];
 	char serial[SCSI_INQ_BUFF_LEN], unit_serial[SCSI_INQ_BUFF_LEN];
+	struct nvme_id_ctrl  ctrl;
+	struct nvme_id_ns ns;
 
 	memset (serial, 0, sizeof(serial));
 	memset (unit_serial, 0, sizeof(unit_serial));
@@ -359,24 +399,42 @@ int main(int argc, char **argv)
 	}
 
 	/* Make page 0 request to get vendor data */
-	make_scsi_request (fd, 0x0, 0x0, buf, sizeof(buf));
+	if (!make_scsi_request (fd, 0x0, 0x0, buf, sizeof(buf))) {
+		if (buf[1] != 0x0) {
+			printf ("invalid page: %x\n", (int) buf[1]);
+			exit (EXIT_FAILURE);
+		}
 
-	if (buf[1] != 0x0) {
-		printf ("invalid page: %x\n", (int) buf[1]);
-		exit (EXIT_FAILURE);
+		memcpy (vendor, buf + 8, VENDOR_LENGTH);
+		vendor[8] = '\0';
+		memcpy (model, buf + 16, MODEL_LENGTH);
+		model[16] = '\0';
+		memcpy (revision, buf + 32, REVISION_LENGTH);
+		revision[4] = '\0';
+	} else { // assuming NVME
+		if (make_nvme_request(fd, &ctrl, &ns) != 0) {
+			perror ("ioctl failed.");
+			exit (EXIT_FAILURE);
+		}
+		snprintf(vendor, sizeof(vendor), "%#x", ctrl.vid);
+		snprintf(revision, sizeof(revision), "%4d", ctrl.vid);
+		memcpy(serial, ctrl.sn, sizeof(ctrl.sn));
+		serial[sizeof(serial)] = '\0';
+		memcpy(model, ctrl.mn, sizeof(model));
+		model[sizeof(model)] = '\0';
+		snprintf(unit_serial, sizeof(unit_serial), "%x%x%x%x%x%x%x%x", ns.eui64[0],
+			ns.eui64[1], ns.eui64[2], ns.eui64[3], ns.eui64[4], ns.eui64[5], ns.eui64[6],
+			ns.eui64[7]);
+
+		goto out;
 	}
-
-	memcpy (vendor, buf + 8, VENDOR_LENGTH);
-	vendor[8] = '\0';
-	memcpy (model, buf + 16, MODEL_LENGTH);
-	model[16] = '\0';
-	memcpy (revision, buf + 32, REVISION_LENGTH);
-	revision[4] = '\0';
 
 	/* Get the best supported page */
 	/* Make page 0 request to get available pages */
-	make_scsi_request (fd, 0x1, 0x0, buf, sizeof(buf));
-
+	if (!!make_scsi_request (fd, 0x1, 0x0, buf, sizeof(buf))) {
+		perror ("ioctl failed.");
+		exit (EXIT_FAILURE);
+	}
 	for (i = 4; i <= buf[3] + 3; i++) {
 		if (buf[i] == PAGE_83) {
 			page = PAGE_83;
@@ -397,12 +455,10 @@ int main(int argc, char **argv)
 		len = buf[3];
 		memcpy (unit_serial, &buf[4], len);
 		make_scsi_request (fd, 0x1, PAGE_83, buf, sizeof(buf));
-
 		if (buf[1] != page) {
 			printf ("invalid page: %x\n", (int) buf[1]);
 			exit (EXIT_FAILURE);
 		}
-
 #if 0
 		/* XXX hack to preserve old behaviour on recent kernels */
 		if (buf[3] == 0x6c)
@@ -413,7 +469,7 @@ int main(int argc, char **argv)
 		 * come first we can pick up the WWN in check_fill_0x83_id().
 		 */
 		for (i = 0; i < sizeof(id_search_list) / sizeof(id_search_list[0]);
-				i++) {
+			i++) {
 			/*
 			 * Examine each descriptor returned. There is normally only
 			 * one or a small number of descriptors.
@@ -421,7 +477,7 @@ int main(int argc, char **argv)
 			for (j = 4; j <= (unsigned int) buf[3] + 3; j += buf[j + 3] + 4) {
 				memset (serial, 0, sizeof(serial));
 				if (check_scsi_serial (&buf[j], &id_search_list[i], serial,
-						vendor, model) == 0) {
+					vendor, model) == 0) {
 					if (print_all) {
 						replace_whitespace (serial, serial, sizeof(serial));
 						replace_chars (serial, NULL);
@@ -432,8 +488,7 @@ int main(int argc, char **argv)
 				}
 			}
 		}
-	}
-	else {
+	} else {
 		/* Parse page80 simply */
 		len = buf[3];
 		serial[0] = 'S';
@@ -464,7 +519,6 @@ int main(int argc, char **argv)
 		replace_whitespace (unit_serial, unit_serial, sizeof(unit_serial));
 		replace_chars (unit_serial, NULL);
 		printf ("ID_SCSI_SERIAL=%s\n", unit_serial);
-
 	}
 
 	return 0;
