@@ -29,8 +29,8 @@
 #include <scsi/scsi.h>
 #include <uuid/uuid.h>
 #include <stdbool.h>
-#include <linux/nvme.h>
 #include <linux/nvme_ioctl.h>
+#include "nvme.h"
 
 /*
  *  * Default 5 second timeout
@@ -124,6 +124,11 @@ static const struct scsi_id_search_values id_search_list[] = { {
 		SCSI_ID_NAA_DONT_CARE, SCSI_ID_ASCII }, { SCSI_ID_VENDOR_SPECIFIC,
 		SCSI_ID_NAA_DONT_CARE, SCSI_ID_BINARY }, { SCSI_ID_VENDOR_SPECIFIC,
 		SCSI_ID_NAA_DONT_CARE, SCSI_ID_ASCII }, };
+
+/*
+ * NVME specific defines
+ */
+#define NVME_ADMIN_CMD_OPCODE_IDENTIFY 0x06
 
 static const char hex_str[] = "0123456789abcdef";
 static int serial_printed = 0;
@@ -262,7 +267,7 @@ static int make_nvme_request(int fd, struct nvme_id_ctrl* ctrl, struct nvme_id_n
 	}
 	memset(&cmd, 0, sizeof(cmd));
 	memset(ctrl, 0, sizeof(struct nvme_id_ctrl));
-	cmd.opcode = nvme_admin_identify;
+	cmd.opcode = NVME_ADMIN_CMD_OPCODE_IDENTIFY;
 	cmd.nsid = 0;
 	cmd.addr = (unsigned long)(ctrl);
 	cmd.data_len = 4096;
@@ -274,7 +279,7 @@ static int make_nvme_request(int fd, struct nvme_id_ctrl* ctrl, struct nvme_id_n
 	nsid = ioctl(fd, NVME_IOCTL_ID);
 	memset(ns, 0, sizeof(struct nvme_id_ns));
 	memset(&cmd, 0, sizeof(cmd));
-	cmd.opcode = nvme_admin_identify;
+	cmd.opcode = NVME_ADMIN_CMD_OPCODE_IDENTIFY;
 	cmd.nsid = nsid;
 	cmd.addr = (unsigned long)(ns);
 	cmd.data_len = 4096;
@@ -400,9 +405,9 @@ int main(int argc, char **argv)
 
 	/* Make page 0 request to get vendor data */
 	if (!make_scsi_request (fd, 0x0, 0x0, buf, sizeof(buf))) {
-		if (buf[1] != 0x0) {
+		if (buf[1] != 0x0 && buf[1] != 0x80 && buf[1] != 0x83) {
 			printf ("invalid page: %x\n", (int) buf[1]);
-			exit (EXIT_FAILURE);
+			goto try_nvme;
 		}
 
 		memcpy (vendor, buf + 8, VENDOR_LENGTH);
@@ -411,29 +416,13 @@ int main(int argc, char **argv)
 		model[16] = '\0';
 		memcpy (revision, buf + 32, REVISION_LENGTH);
 		revision[4] = '\0';
-	} else { // assuming NVME
-		if (make_nvme_request(fd, &ctrl, &ns) != 0) {
-			perror ("ioctl failed.");
-			exit (EXIT_FAILURE);
-		}
-		snprintf(vendor, sizeof(vendor), "%#x", ctrl.vid);
-		snprintf(revision, sizeof(revision), "%4d", ctrl.vid);
-		memcpy(serial, ctrl.sn, sizeof(ctrl.sn));
-		serial[sizeof(serial)] = '\0';
-		memcpy(model, ctrl.mn, sizeof(model));
-		model[sizeof(model)] = '\0';
-		snprintf(unit_serial, sizeof(unit_serial), "%x%x%x%x%x%x%x%x", ns.eui64[0],
-			ns.eui64[1], ns.eui64[2], ns.eui64[3], ns.eui64[4], ns.eui64[5], ns.eui64[6],
-			ns.eui64[7]);
-
-		goto out;
 	}
 
 	/* Get the best supported page */
 	/* Make page 0 request to get available pages */
 	if (!!make_scsi_request (fd, 0x1, 0x0, buf, sizeof(buf))) {
 		perror ("ioctl failed.");
-		exit (EXIT_FAILURE);
+		goto try_nvme;
 	}
 	for (i = 4; i <= buf[3] + 3; i++) {
 		if (buf[i] == PAGE_83) {
@@ -457,13 +446,8 @@ int main(int argc, char **argv)
 		make_scsi_request (fd, 0x1, PAGE_83, buf, sizeof(buf));
 		if (buf[1] != page) {
 			printf ("invalid page: %x\n", (int) buf[1]);
-			exit (EXIT_FAILURE);
+			goto try_nvme;
 		}
-#if 0
-		/* XXX hack to preserve old behaviour on recent kernels */
-		if (buf[3] == 0x6c)
-			buf[3] = 0x60;
-#endif
 		/*
 		 * Search for a match in the prioritized id_search_list - since WWN ids
 		 * come first we can pick up the WWN in check_fill_0x83_id().
@@ -498,6 +482,23 @@ int main(int argc, char **argv)
 		for (j = 4; j < len + 4; j++, i++) {
 			serial[i] = buf[j];
 		}
+	}
+	try_nvme:
+	if (strnlen(serial, SCSI_INQ_BUFF_LEN) < 2 && strnlen(unit_serial, SCSI_INQ_BUFF_LEN) < 2) {
+		// assuming NVME
+		if (make_nvme_request(fd, &ctrl, &ns) != 0) {
+			perror ("ioctl failed.");
+			exit (EXIT_FAILURE);
+		}
+		snprintf(vendor, sizeof(vendor), "%#x", ctrl.vid);
+		snprintf(revision, sizeof(revision), "%4d", ctrl.vid);
+		memcpy(serial, ctrl.sn, sizeof(ctrl.sn));
+		serial[sizeof(serial)] = '\0';
+		memcpy(model, ctrl.mn, sizeof(model));
+		model[sizeof(model)] = '\0';
+		snprintf(unit_serial, sizeof(unit_serial), "%x%x%x%x%x%x%x%x", ns.eui64[0],
+			ns.eui64[1], ns.eui64[2], ns.eui64[3], ns.eui64[4], ns.eui64[5], ns.eui64[6],
+			ns.eui64[7]);
 	}
 	out: replace_whitespace (vendor, vendor, sizeof(vendor));
 	replace_chars (vendor, NULL);
